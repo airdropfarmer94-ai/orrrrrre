@@ -1,0 +1,231 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>ORE Custom Tiles Bot (v3) — FIXED</title>
+  <script src="https://unpkg.com/@solana/web3.js@1.95.2/lib/index.iife.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/react@18/umd/react.production.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/react-dom@18/umd/react-dom.production.min.js"></script>
+  <!-- Privy / Auth SDK (ensure correct public UMD URL for your version) -->
+  <script src="https://auth.privy.io/core.umd.min.js"></script>
+  <style>
+    body{margin:0;background:#000;color:#0f0;font-family:Arial;text-align:center;padding:20px;}
+    h1{font-size:40px;margin:20px 0;}
+    button{padding:18px 36px;margin:15px;background:#00ff00;color:black;border:none;border-radius:12px;font-size:22px;font-weight:bold;cursor:pointer;}
+    button:disabled{background:#555;cursor:not-allowed;}
+    button.stop{background:#ff0033;color:#fff;}
+    #grid{display:grid;grid-template-columns:repeat(5,1fr);gap:12px;max-width:420px;margin:40px auto;}
+    .tile{width:70px;height:70px;background:#b8860b;color:white;font-size:28px;font-weight:bold;display:flex;align-items:center;justify-content:center;cursor:pointer;border:4px solid #333;border-radius:6px;}
+    .tile.selected{background:#00ff00;color:black;border-color:#00ff00;box-shadow:0 0 20px #0f0;}
+    .log{background:#111;padding:20px;height:380px;overflow-y:auto;margin:30px auto;max-width:700px;border-radius:12px;font-family:monospace;font-size:15px;border:1px solid #0f0;}
+    input{padding:15px;width:280px;margin:15px;border-radius:12px;background:#222;color:#0f0;border:2px solid #0f0;font-size:18px;text-align:center;}
+  </style>
+</head>
+<body>
+  <h1>ORE Custom Tiles Bot (v3) — FIXED</h1>
+  <div id="root"></div>
+
+<script>
+  // IMPORTANT: DO NOT commit secrets (Privy App ID, RPC keys, etc.) into a public repo.
+  // Replace the placeholders below before running locally, or better: load them from a server.
+  const PRIVY_APP_ID = "cmi8rgcw9008nl30cnnxgn9mw";         // e.g. from Privy dashboard
+  const RPC = "https://mainnet.helius-rpc.com/?api-key=8952f5e0-8f66-465a-8a4c-29152df1f3cd";                      // e.g. https://mainnet.helius-rpc.com/?api-key=...
+  // NOTE: ORE_PROGRAM and ORE_MINT are kept as in the original file; verify these values are correct.
+  const ORE_PROGRAM = new solanaWeb3.PublicKey("oreV3EG1i9BEgiAJ8b177Z2S2rMarzak4NMv1kULvWv");
+  const ORE_MINT    = new solanaWeb3.PublicKey("oreoU2P8bN6jkk3jbaiVxYnG1dCXcYxwhwyK9jSybcp");
+
+  // IMPORTANT: You MUST supply the correct additional accounts required by the ORE v3 program
+  // for the bet instruction. The program expects a specific set of accounts (PDAs, mint, token account, etc).
+  // Leave as [] for now and update before running. Example item format:
+  // { pubkey: "<PUBKEY_STRING>", isSigner: false, isWritable: false }
+  const ORE_ADDITIONAL_ACCOUNTS = [
+    // Example: { pubkey: "11111111111111111111111111111111", isSigner: false, isWritable: false },
+    // TODO: fill with the correct accounts required by the ORE v3 program (see its docs / on-chain ABI).
+  ];
+
+  const { useState, useEffect } = React;
+
+  function App() {
+    const [wallet, setWallet] = useState(null);
+    const [balance, setBalance] = useState(0);
+    const [tiles, setTiles] = useState([]);
+    const [perTile, setPerTile] = useState(0.0001);
+    const [total, setTotal] = useState(0);
+    const [streak, setStreak] = useState(0);
+    const [running, setRunning] = useState(false);
+    const [log, setLog] = useState(["Loading Privy..."]);
+    const [privyReady, setPrivyReady] = useState(false);
+
+    // Robust logging with cap at 30 messages
+    const logMsg = (m) => {
+      setLog(l => {
+        const next = [...l, `${new Date().toLocaleTimeString()}: ${m}`];
+        return next.slice(-30);
+      });
+    };
+
+    useEffect(() => {
+      let attempts = 0;
+      const init = () => {
+        if (window.Privy) {
+          try {
+            const privy = new window.Privy({
+              appId: PRIVY_APP_ID,
+              chainId: 101  // Solana mainnet
+            });
+            privy.on && privy.on('login', async user => {
+              if (!user || !user.wallet) {
+                logMsg("Login returned no wallet. Check Privy response.");
+                return;
+              }
+              setWallet(user.wallet);
+              logMsg("Connected: " + (user.wallet.address ? user.wallet.address.slice(0,8) + "..." : "unknown address"));
+              try {
+                const conn = new solanaWeb3.Connection(RPC);
+                const bal = await conn.getBalance(new solanaWeb3.PublicKey(user.wallet.address));
+                setBalance(bal / 1e9);
+              } catch (e) {
+                logMsg("Failed to fetch balance: " + (e.message || e));
+              }
+            });
+            window.privy = privy;
+            setPrivyReady(true);
+            logMsg("Privy ready – click SIGN IN");
+          } catch (e) {
+            console.error("Privy init error", e);
+            logMsg("Privy initialization error: " + (e.message || e));
+          }
+        } else if (attempts < 20) {
+          attempts++;
+          setTimeout(init, 500);
+        } else logMsg("Privy failed to load");
+      };
+      init();
+    }, []);
+
+    const login = () => {
+      if (!PRIVY_APP_ID || PRIVY_APP_ID.startsWith("<REPLACE")) {
+        logMsg("Privy app id not configured — set PRIVY_APP_ID before signing in.");
+        return alert("Privy App ID missing. Set PRIVY_APP_ID in the script.");
+      }
+      if (window.privy && window.privy.login) {
+        window.privy.login();
+      } else {
+        logMsg("Privy still loading...");
+        setTimeout(login, 1000);
+      }
+    };
+
+    const toggle = i => running ? null : setTiles(t => t.includes(i) ? t.filter(x=>x!==i) : [...t,i].sort((a,b)=>a-b));
+
+    const start = () => {
+      if (!tiles.length) return alert("Select tiles!");
+      if (!RPC || RPC.startsWith("<REPLACE")) {
+        logMsg("RPC URL not configured. Set RPC in the script.");
+        return alert("RPC not configured. Set RPC constant in the script.");
+      }
+      if (!Array.isArray(ORE_ADDITIONAL_ACCOUNTS) || ORE_ADDITIONAL_ACCOUNTS.length === 0) {
+        logMsg("ORE additional accounts not configured. See comments in source.");
+        return alert("ORE additional accounts not configured. Fill ORE_ADDITIONAL_ACCOUNTS.");
+      }
+      setTotal(tiles.length * perTile);
+      setRunning(true);
+      setStreak(0);
+      logMsg(`STARTED – ${tiles.length} tiles @ ${perTile} SOL`);
+      // small delay before first bet
+      setTimeout(() => bet().catch(e => { logMsg("Bet loop error: " + (e.message || e)); setRunning(false); }), 3000);
+    };
+
+    // Build instruction data: op (1 byte), tile (1 byte), lamports (8 bytes little-endian)
+    function buildData(op, tile, lamportsBigInt) {
+      // produce Uint8Array (works in browser)
+      const buf = new ArrayBuffer(10);
+      const view = new DataView(buf);
+      view.setUint8(0, op & 0xff);
+      view.setUint8(1, tile & 0xff);
+      try {
+        // modern browsers support setBigUint64
+        view.setBigUint64(2, lamportsBigInt, true); // little-endian
+      } catch (e) {
+        // fallback: manual byte write
+        let v = lamportsBigInt;
+        for (let i = 0; i < 8; i++) {
+          view.setUint8(2 + i, Number(v & 0xffn));
+          v = v >> 8n;
+        }
+      }
+      return new Uint8Array(buf);
+    }
+
+    // Helper to get account metas. Ensures the user's account is always first (signer).
+    function getInstructionAccounts(userPubkeyStr) {
+      try {
+        const accounts = [
+          { pubkey: new solanaWeb3.PublicKey(userPubkeyStr), isSigner: true, isWritable: true },
+        ];
+        for (const a of ORE_ADDITIONAL_ACCOUNTS) {
+          accounts.push({
+            pubkey: new solanaWeb3.PublicKey(a.pubkey),
+            isSigner: !!a.isSigner,
+            isWritable: !!a.isWritable
+          });
+        }
+        return accounts;
+      } catch (e) {
+        throw new Error("Invalid ORE_ADDITIONAL_ACCOUNTS entry: " + (e.message || e));
+      }
+    }
+
+    // Send one transaction per tile (safer than one huge transaction). Detect wallet.signTransaction presence.
+    const bet = async () => {
+      if (!running) return;
+      if (!wallet || !wallet.address) { logMsg("Wallet not connected"); setRunning(false); return; }
+
+      const conn = new solanaWeb3.Connection(RPC);
+      // lamports per tile - use current 'total' divided evenly across selected tiles
+      const lamportsPerTile = BigInt(Math.floor((total / tiles.length) * 1e9));
+
+      // sanity checks
+      if (lamportsPerTile <= 0n) {
+        logMsg("Bet amount too small");
+        setRunning(false);
+        return;
+      }
+
+      try {
+        for (const t of tiles) {
+          if (!running) break;
+          // Prepare instruction
+          let accounts;
+          try {
+            accounts = getInstructionAccounts(wallet.address);
+          } catch (e) {
+            logMsg("Account config error: " + (e.message || e));
+            setRunning(false);
+            return;
+          }
+          const data = buildData(2, t, lamportsPerTile);
+          const ix = new solanaWeb3.TransactionInstruction({
+            programId: ORE_PROGRAM,
+            keys: accounts,
+            data
+          });
+
+          // Build transaction
+          const tx = new solanaWeb3.Transaction().add(ix);
+          const { blockhash, lastValidBlockHeight } = await conn.getLatestBlockhash();
+          tx.recentBlockhash = blockhash;
+          tx.feePayer = new solanaWeb3.PublicKey(wallet.address);
+
+          // Sign transaction: provider must support signTransaction
+          let signed;
+          if (typeof wallet.signTransaction === "function") {
+            signed = await wallet.signTransaction(tx);
+          } else {
+            // We can't reliably sign without a known provider API. Notify user.
+            throw new Error("Wallet provider does not implement signTransaction. Update code for your provider.");
+          }
+
+          // Send and confirm
+          const raw = signed.serialize();
+          const sig = await
