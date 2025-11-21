@@ -29,203 +29,151 @@
 
 <script>
 /*
-  Privy loader + diagnostics
+  Privy loader with primary+fallback URLs and verbose diagnostics.
+  Updated to try jsDelivr first (https://cdn.jsdelivr.net/npm/privy/core.umd.min.js),
+  then the auth.privy.io URL, then a local fallback /core.umd.min.js.
 
-  Problem observed:
-  - user clicked SIGN IN but window.Privy / window.privy never appeared.
-  - No console error shown previously.
-
-  This updated script:
-  - attempts to dynamically load the Privy UMD script and reports load success/failure.
-  - exposes a promise window.PrivyReady that resolves when the UMD script registers window.Privy (or window.privy), or rejects with an error object containing details.
-  - the app's login() now awaits window.PrivyReady and shows concise diagnostics when the script cannot be loaded.
-  - This helps determine whether the issue is: network 404/block, CSP, or the script exposes a different global name.
+  NOTE: For production, pin a version: https://cdn.jsdelivr.net/npm/privy@<version>/core.umd.min.js
 */
 
-/* ---------- CONFIG (you provided these) ---------- */
 const APP_CONFIG = window.APP_CONFIG || {
   PRIVY_APP_ID: "cmi8rgcw9008nl30cnnxgn9mw",
   RPC: "https://mainnet.helius-rpc.com/?api-key=8952f5e0-8f66-465a-8a4c-29152df1f3cd"
 };
 
-/* The Privy UMD URL used previously */
-const PRIVY_UMD_URL = "https://auth.privy.io/core.umd.min.js";
+/* Try jsDelivr first, then auth.privy.io, then local fallback */
+const PRIVY_URLS = [
+  "https://cdn.jsdelivr.net/npm/privy/core.umd.min.js",
+  "https://auth.privy.io/core.umd.min.js",
+  "/core.umd.min.js"
+];
 
-/* Global promise that resolves when Privy is available or rejects with diagnostics */
-(function setupPrivyLoader() {
-  if (window.PrivyReady) return; // already set
-  window.PrivyReady = new Promise((resolve, reject) => {
-    // If Privy is already present (from the page), resolve immediately
-    if (window.Privy || window.privy) {
-      return resolve({ source: 'already-present', object: !!window.Privy ? 'Privy' : 'privy' });
-    }
-
-    // Attempt to load the script dynamically
-    const s = document.createElement('script');
-    s.src = PRIVY_UMD_URL;
-    s.async = true;
-    s.crossOrigin = 'anonymous';
-
-    let timedOut = false;
-    const timeout = setTimeout(() => {
-      timedOut = true;
-      const err = {
-        reason: 'timeout',
-        message: `Loading ${PRIVY_UMD_URL} timed out after 10s.`,
-        url: PRIVY_UMD_URL
-      };
-      reject(err);
-    }, 10000);
-
-    s.onload = () => {
-      clearTimeout(timeout);
-      // Wait a short tick for the UMD to register globals
-      setTimeout(() => {
-        if (window.Privy || window.privy) {
-          resolve({ source: 'loaded', object: !!window.Privy ? 'Privy' : 'privy' });
-        } else {
-          // Script loaded but global not present -> possible UMD uses different global name or failed init
-          reject({ reason: 'no-global', message: 'Script loaded but window.Privy/window.privy not defined', url: PRIVY_UMD_URL });
-        }
-      }, 50);
-    };
-
-    s.onerror = (ev) => {
-      clearTimeout(timeout);
-      // Provide as much diagnostic detail as possible
-      reject({ reason: 'network-error', message: `Failed to load ${PRIVY_UMD_URL}`, url: PRIVY_UMD_URL, event: String(ev) });
-    };
-
-    // Append to head
-    document.head.appendChild(s);
-  });
-})();
-
-/* helper to list methods of an object safely */
-function listMethods(obj) {
-  if (!obj) return [];
-  try {
-    return Object.getOwnPropertyNames(obj).filter(k => typeof obj[k] === 'function');
-  } catch (e) {
-    return [];
-  }
-}
-
-/* light diag logger that writes to console and later to UI via callback */
 let uiLogCallback = null;
-function diag(msg) {
+function uiLog(msg) {
   try { console.log(msg); } catch(e){}
   if (typeof uiLogCallback === 'function') uiLogCallback(msg);
 }
 
-/* ---------- Minimal app focused on login diagnostics ---------- */
+function listMethods(obj) {
+  if (!obj) return [];
+  try { return Object.getOwnPropertyNames(obj).filter(k=>typeof obj[k] === 'function'); } catch(e) { return []; }
+}
+
+/* Build a global promise that tries each URL until one loads and registers a global */
+window.PrivyReady = (function() {
+  if (window.PrivyReady) return window.PrivyReady;
+  return new Promise((resolve, reject) => {
+    let tried = 0;
+    const tryNext = () => {
+      if (tried >= PRIVY_URLS.length) {
+        reject({ reason: 'all-failed', tried: PRIVY_URLS });
+        return;
+      }
+      const url = PRIVY_URLS[tried++];
+      uiLog(`Attempting to load Privy UMD from: ${url}`);
+      const s = document.createElement('script');
+      s.src = url;
+      s.async = true;
+      s.crossOrigin = 'anonymous';
+      let timer = setTimeout(() => {
+        uiLog(`Loading ${url} timed out after 10s`);
+        s.onerror = s.onload = null;
+        s.remove();
+        tryNext();
+      }, 10000);
+
+      s.onload = () => {
+        clearTimeout(timer);
+        setTimeout(() => {
+          if (window.Privy || window.privy) {
+            uiLog(`Loaded Privy UMD from ${url}. exposed: ${window.Privy ? 'window.Privy' : 'window.privy'}`);
+            resolve({ url, object: window.Privy ? 'Privy' : 'privy' });
+          } else {
+            uiLog(`Script loaded from ${url} but global not present. Trying next fallback.`);
+            s.remove();
+            tryNext();
+          }
+        }, 50);
+      };
+
+      s.onerror = (ev) => {
+        clearTimeout(timer);
+        uiLog(`Failed to load ${url} (network error). Trying next fallback if any.`);
+        s.onerror = s.onload = null;
+        s.remove();
+        tryNext();
+      };
+
+      document.head.appendChild(s);
+    };
+    tryNext();
+  });
+})();
+
+/* Minimal app UI for diagnostics and login */
 const { useState, useEffect } = React;
 
 function App() {
   const [status, setStatus] = useState("Waiting for Privy...");
   const [log, setLog] = useState([`${new Date().toLocaleTimeString()}: Ready`]);
 
-  // expose UI log callback
   useEffect(() => { uiLogCallback = m => setLog(l => [...l.slice(-49), `${new Date().toLocaleTimeString()}: ${m}`]); }, []);
 
-  // Try to await PrivyReady at load to surface early failures
   useEffect(() => {
-    setStatus("Attempting to load Privy UMD...");
+    setStatus("Loading Privy UMD...");
     window.PrivyReady.then(info => {
       setStatus(`Privy loaded (${info.object})`);
-      diag("PrivyReady resolved: " + JSON.stringify(info));
+      uiLog(`PrivyReady resolved: ${JSON.stringify(info)}`);
+      setLog(l => [...l.slice(-49), `${new Date().toLocaleTimeString()}: Privy loaded (${info.object}) from ${info.url}`]);
     }).catch(err => {
       setStatus("Privy load failed");
-      diag("PrivyReady rejected: " + JSON.stringify(err));
-      // Give extra guidance in the UI
+      uiLog("PrivyReady rejected: " + JSON.stringify(err));
       setLog(l => [...l.slice(-49),
-        `${new Date().toLocaleTimeString()}: Privy load failed — see diagnostics below.`,
-        `${new Date().toLocaleTimeString()}: ${JSON.stringify(err)}`
+        `${new Date().toLocaleTimeString()}: Privy load failed — diagnostics: ${JSON.stringify(err)}`,
+        `${new Date().toLocaleTimeString()}: Next: open DevTools → Network, look for requests to the Privy URLs (status/size).`,
+        `${new Date().toLocaleTimeString()}: If 404/403: confirm the UMD URL or host locally at /core.umd.min.js.`
       ]);
     });
   }, []);
 
-  // Robust login function that awaits PrivyReady then calls available method
   const login = async () => {
     setLog(l => [...l.slice(-49), `${new Date().toLocaleTimeString()}: SIGN IN clicked`]);
-    setStatus("Signing in... (awaiting Privy)");
-
+    setStatus("Attempting sign in...");
     try {
       const info = await window.PrivyReady;
-      diag("PrivyReady info: " + JSON.stringify(info));
-      setLog(l => [...l.slice(-49), `${new Date().toLocaleTimeString()}: Privy loaded (${info.object}). Trying login method.`]);
+      setLog(l => [...l.slice(-49), `${new Date().toLocaleTimeString()}: Privy loaded (${info.object}), attempting login.`]);
 
-      // If an instance already exists at window.privy, call its login
       if (window.privy && typeof window.privy.login === 'function') {
-        diag("Calling window.privy.login()");
-        try {
-          const maybe = window.privy.login();
-          if (maybe && typeof maybe.then === 'function') await maybe;
-          setStatus("Invoked window.privy.login()");
-          setLog(l => [...l.slice(-49), `${new Date().toLocaleTimeString()}: Called window.privy.login()`]);
-          return;
-        } catch (e) {
-          diag("window.privy.login() threw: " + (e && e.message));
-          setLog(l => [...l.slice(-49), `${new Date().toLocaleTimeString()}: window.privy.login() threw: ${e && e.message}`]);
-        }
+        setLog(l => [...l.slice(-49), `${new Date().toLocaleTimeString()}: Calling window.privy.login()`]);
+        try { const r = window.privy.login(); if (r && typeof r.then === 'function') await r; setStatus('Login invoked'); return; } catch(e) { setLog(l => [...l.slice(-49), `window.privy.login threw: ${e && e.message}`]); }
       }
-
-      // If the global constructor exists, instantiate and call common methods
       if (window.Privy && typeof window.Privy === 'function') {
-        diag("window.Privy constructor found. Listing methods: " + listMethods(window.Privy).join(", "));
+        setLog(l => [...l.slice(-49), `${new Date().toLocaleTimeString()}: Calling new window.Privy(...)`]);
         try {
           const inst = new window.Privy({ appId: APP_CONFIG.PRIVY_APP_ID, chainId: 101 });
           window.privy = window.privy || inst;
           const methods = listMethods(inst);
-          setLog(l => [...l.slice(-49), `${new Date().toLocaleTimeString()}: Created Privy instance. Methods: ${methods.join(", ")}`]);
-
-          // Try common names
-          if (typeof inst.login === 'function') {
-            setLog(l => [...l.slice(-49), `${new Date().toLocaleTimeString()}: Calling instance.login()`]);
-            await inst.login();
-            setStatus("Invoked instance.login()");
-            return;
-          } else if (typeof inst.open === 'function') {
-            setLog(l => [...l.slice(-49), `${new Date().toLocaleTimeString()}: Calling instance.open()`]);
-            inst.open();
-            setStatus("Invoked instance.open()");
-            return;
-          } else if (typeof inst.signIn === 'function') {
-            setLog(l => [...l.slice(-49), `${new Date().toLocaleTimeString()}: Calling instance.signIn()`]);
-            await inst.signIn();
-            setStatus("Invoked instance.signIn()");
-            return;
-          } else {
-            setLog(l => [...l.slice(-49), `${new Date().toLocaleTimeString()}: No login/open/signIn on instance`]);
-          }
+          setLog(l => [...l.slice(-49), `${new Date().toLocaleTimeString()}: Privy instance created. methods: ${methods.join(', ')}`]);
+          if (typeof inst.login === 'function') { await inst.login(); setStatus('Login invoked'); return; }
+          if (typeof inst.open === 'function') { inst.open(); setStatus('Open invoked'); return; }
+          if (typeof inst.signIn === 'function') { await inst.signIn(); setStatus('SignIn invoked'); return; }
         } catch (e) {
-          setLog(l => [...l.slice(-49), `${new Date().toLocaleTimeString()}: Error creating/calling instance: ${e && e.message}`]);
-          diag("Privy instance creation error: " + (e && e.message));
+          setLog(l => [...l.slice(-49), `Privy instance call threw: ${e && e.message}`]);
         }
       }
 
-      // If we reach here, no typical entrypoint worked
-      setStatus("Could not invoke Privy login");
       setLog(l => [...l.slice(-49),
-        `${new Date().toLocaleTimeString()}: Could not invoke Privy login. Diagnostic snapshot below:`,
-        `${new Date().toLocaleTimeString()}: window.Privy defined: ${!!window.Privy}, window.privy defined: ${!!window.privy}`,
-        `${new Date().toLocaleTimeString()}: window.Privy methods: ${listMethods(window.Privy).join(", ")}`,
-        `${new Date().toLocaleTimeString()}: window.privy methods: ${listMethods(window.privy).join(", ")}`,
-        `${new Date().toLocaleTimeString()}: APP_CONFIG: ${JSON.stringify(APP_CONFIG)}`
+        `${new Date().toLocaleTimeString()}: Could not invoke Privy login. Diagnostic snapshot:`,
+        `window.Privy defined: ${!!window.Privy}`,
+        `window.privy defined: ${!!window.privy}`,
+        `window.Privy methods: ${listMethods(window.Privy).join(', ')}`,
+        `window.privy methods: ${listMethods(window.privy).join(', ')}`,
+        `APP_CONFIG: ${JSON.stringify(APP_CONFIG)}`
       ]);
+      setStatus("Privy login could not be invoked (see log)");
     } catch (err) {
-      // PrivyReady rejected; err contains diagnostic info from loader
-      setStatus("Privy not available");
       setLog(l => [...l.slice(-49), `${new Date().toLocaleTimeString()}: PrivyReady error: ${JSON.stringify(err)}`]);
-      diag("PrivyReady error: " + JSON.stringify(err));
-      // Helpful follow-ups for the user:
-      setLog(l => [...l.slice(-49),
-        `${new Date().toLocaleTimeString()}: Next steps:`,
-        "- Open DevTools → Network, filter by the script URL and check status (200/404/blocked).",
-        "- If 404/403: confirm PRIVY script URL and network accessibility.",
-        "- If blocked by CSP: add appropriate script-src in the server's CSP header or serve the script from your domain.",
-        "- If the script loads but no global appears: the UMD may expose a different global; paste the loader diagnostic here and I'll adapt the code."
-      ]);
+      setStatus("Privy not available");
     }
   };
 
@@ -238,7 +186,7 @@ function App() {
   );
 }
 
-/* Mount app */
+/* mount */
 (function mount() {
   const rootEl = document.getElementById('root');
   if (ReactDOM && ReactDOM.createRoot) {
